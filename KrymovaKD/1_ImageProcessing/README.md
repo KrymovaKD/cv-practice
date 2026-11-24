@@ -33,8 +33,6 @@ OpenCV хранит цветные изображения в порядке **BG
 ├── README.md
 ├── images/
 │   └── test.jpg
-├── output/
-│   └── results/
 └── filters/
     ├── __init__.py
     ├── base.py
@@ -53,7 +51,6 @@ OpenCV хранит цветные изображения в порядке **BG
 - `filters/color.py` — преобразования Grayscale, Antique, FadeColor и Film.
 - `filters/effects.py` — эффекты Matte, Noise и Neon, а также вспомогательные функции размытия.
 - `images/` — исходные изображения (`test.jpg`).
-- `output/` — каталог результатов обработки; `output/results/` используется для сохранения демонстрационных результатов.
 - `requirements.txt` — список зависимостей проекта.
 
 Все фильтры реализованы в виде классов с методом `apply`. Метод `ImageFilter.get_filter(name)` позволяет получить необходимый фильтр по его названию.
