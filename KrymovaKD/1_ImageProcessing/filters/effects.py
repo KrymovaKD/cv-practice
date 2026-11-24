@@ -28,7 +28,20 @@ class Matte(ImageFilter):
         return np.clip(result, 0, 255).astype(np.uint8)
 
 
+def box_blur(array):
+    """Усредняющее размытие двумерного массива 3x3."""
+    array = np.asarray(array, dtype=np.float32)
 
+    if array.ndim != 2:
+        raise ValueError("box_blur ожидает двумерный массив")
+
+    padded = np.pad(array, 1, mode="edge")
+
+    return (
+        padded[:-2, :-2] + padded[:-2, 1:-1] + padded[:-2, 2:] +
+        padded[1:-1, :-2] + padded[1:-1, 1:-1] + padded[1:-1, 2:] +
+        padded[2:, :-2] + padded[2:, 1:-1] + padded[2:, 2:]
+    ) / 9.0
 
 class Noise(ImageFilter):
     """Состаривание фотографии: зерно, пыль, царапины и яркая засветка."""
@@ -43,14 +56,11 @@ class Noise(ImageFilter):
         result = image.astype(np.float32).copy()
         height, width = image.shape[:2]
 
-        # 1. Немного затемняем фотографию.
         result *= 0.88
 
-        # 2. Добавляем плёночное зерно.
         grain = rng.normal(0, amount * 24, (height, width, 1))
         result += grain.astype(np.float32)
 
-        # 3. Создаём тонкие царапины.
         light_scratches = np.zeros((height, width), dtype=np.float32)
         dark_scratches = np.zeros((height, width), dtype=np.float32)
 
@@ -151,7 +161,6 @@ class Noise(ImageFilter):
                 mask[py, px] = max(mask[py, px], brightness)
                 previous_x, previous_y = px, py
 
-        # Смягчаем царапины.
         light_soft = box_blur(light_scratches)
         dark_soft = box_blur(dark_scratches)
 
@@ -163,15 +172,12 @@ class Noise(ImageFilter):
         ).astype(np.float32)
         light *= texture
 
-        # Светлые тёплые царапины.
         result[:, :, 0] += light * 58
         result[:, :, 1] += light * 64
         result[:, :, 2] += light * 68
 
-        # Тёмные царапины.
         result -= dark[:, :, None] * 28
 
-        # 4. Добавляем пыль.
         dust_count = int(height * width * 0.00022)
 
         for _ in range(dust_count):
@@ -197,7 +203,6 @@ class Noise(ImageFilter):
                         result[py, px, 1] += value * 0.92
                         result[py, px, 2] += value
 
-        # 5. Яркий оранжево-красный блик снизу слева.
         yy, xx = np.mgrid[0:height, 0:width]
         x_norm = xx / max(width - 1, 1)
         y_norm = yy / max(height - 1, 1)
@@ -208,7 +213,6 @@ class Noise(ImageFilter):
         )
         leak = np.clip(1 - distance, 0, 1) ** 2
 
-        # Усиленное локальное свечение в углу.
         extra_leak = 0.65 * np.exp(-(
             (x_norm / 0.28) ** 2
             + ((1 - y_norm) / 0.22) ** 2
@@ -216,12 +220,10 @@ class Noise(ImageFilter):
 
         leak = np.maximum(leak, extra_leak).astype(np.float32)
 
-        # Размываем маску, чтобы переходы оставались мягкими.
         leak = box_blur(leak)
         leak = box_blur(leak)
         leak = box_blur(leak)
 
-        # BGR: яркий оранжево-красный свет.
         result[:, :, 0] += leak * 45
         result[:, :, 1] += leak * 110
         result[:, :, 2] += leak * 190
@@ -231,103 +233,171 @@ class Noise(ImageFilter):
 
 
 
-def box_blur(image):
-    """Размывает изображение усреднением соседних пикселей 3x3"""
-
-    if image.ndim not in (2, 3):
-        raise ValueError("Ожидается двумерное или цветное изображение")
-
-    if image.ndim == 2:
-        padded = np.pad(image, ((1, 1), (1, 1)), mode="edge")
-    else:
-        padded = np.pad(
-            image,
-            ((1, 1), (1, 1), (0, 0)),
-            mode="edge"
-        )
-
-    result = np.zeros_like(image, dtype=np.float32)
-
-    for y in range(image.shape[0]):
-        for x in range(image.shape[1]):
-            neighborhood = padded[y:y + 3, x:x + 3]
-            result[y, x] = np.mean(neighborhood, axis=(0, 1))
-
-    return result
-
-
-
-
 
 class Neon(ImageFilter):
-    """Создаёт неоновое свечение на основных контурах изображения"""
 
-    def apply(self, image, strength=2.0, blur=1.3, **kwargs):
-        if strength < 0:
-            raise ValueError("strength не может быть отрицательным")
-        if blur < 0:
-            raise ValueError("blur не может быть отрицательным")
+    @staticmethod
+    def fast_blur(array):
+        """Быстрое сглаживание 3x3 для подготовки изображения."""
+        padded = np.pad(array, 1, mode="edge")
 
-        original = image.astype(np.float32)
+        return (
+            padded[:-2, :-2] + padded[:-2, 1:-1] + padded[:-2, 2:] +
+            padded[1:-1, :-2] + padded[1:-1, 1:-1] + padded[1:-1, 2:] +
+            padded[2:, :-2] + padded[2:, 1:-1] + padded[2:, 2:]
+        ) / 9.0
 
-        # 1. Переводим изображение в яркость (порядок каналов BGR).
+    @staticmethod
+    def gaussian_blur(array, sigma):
+        """Быстрая аппроксимация гауссова размытия тремя box blur."""
+
+        if sigma <= 0:
+            return array.astype(np.float32).copy()
+
+        result = array.astype(np.float32)
+        radius = max(1, int(round(sigma)))
+        window = 2 * radius + 1
+
+        for _ in range(3):
+
+            padded = np.pad(
+                result,
+                ((0, 0), (radius, radius), (0, 0)),
+                mode="edge"
+            )
+
+            cumulative = np.cumsum(
+                padded,
+                axis=1,
+                dtype=np.float32
+            )
+
+            cumulative = np.pad(
+                cumulative,
+                ((0, 0), (1, 0), (0, 0)),
+                mode="constant"
+            )
+
+            horizontal = (
+                cumulative[:, window:, :] -
+                cumulative[:, :-window, :]
+            ) / window
+
+            # Вертикальное размытие
+            padded = np.pad(
+                horizontal,
+                ((radius, radius), (0, 0), (0, 0)),
+                mode="edge"
+            )
+
+            cumulative = np.cumsum(
+                padded,
+                axis=0,
+                dtype=np.float32
+            )
+
+            cumulative = np.pad(
+                cumulative,
+                ((1, 0), (0, 0), (0, 0)),
+                mode="constant"
+            )
+
+            result = (
+                cumulative[window:, :, :] -
+                cumulative[:-window, :, :]
+            ) / window
+
+        return result
+
+    def apply(self, image, strength=2.0, blur=3.5, **kwargs):
+        """Создает неоновое свечение по контурам изображения."""
+
+        image = image.astype(np.float32)
+
         gray = (
-            0.114 * original[:, :, 0]
-            + 0.587 * original[:, :, 1]
-            + 0.299 * original[:, :, 2]
+            0.114 * image[:, :, 0] +
+            0.587 * image[:, :, 1] +
+            0.299 * image[:, :, 2]
         )
 
-        # 2. Немного сглаживаем яркость, чтобы уменьшить мелкие детали.
-        smooth = box_blur(gray)
-        smooth = box_blur(smooth)
+        gray = self.fast_blur(gray)
+        gray = self.fast_blur(gray)
 
-        # 3. Вычисляем изменения яркости по горизонтали и вертикали.
-        dx = np.zeros_like(smooth)
-        dy = np.zeros_like(smooth)
+        padded = np.pad(gray, 1, mode="edge")
 
-        dx[:, 1:-1] = (smooth[:, 2:] - smooth[:, :-2]) / 2
-        dy[1:-1, :] = (smooth[2:, :] - smooth[:-2, :]) / 2
+        gx = (
+            -padded[:-2, :-2] + padded[:-2, 2:] -
+            2 * padded[1:-1, :-2] +
+            2 * padded[1:-1, 2:] -
+            padded[2:, :-2] + padded[2:, 2:]
+        )
 
-        edges = np.sqrt(dx ** 2 + dy ** 2)
+        gy = (
+            -padded[:-2, :-2] -
+            2 * padded[:-2, 1:-1] -
+            padded[:-2, 2:] +
+            padded[2:, :-2] +
+            2 * padded[2:, 1:-1] +
+            padded[2:, 2:]
+        )
 
-        # 4. Используем более высокий порог — мелких линий станет меньше.
-        threshold = np.percentile(edges, 78)
-        max_edge = np.percentile(edges, 99)
+        magnitude = np.sqrt(gx ** 2 + gy ** 2)
 
-        if max_edge > threshold:
+        low = np.percentile(magnitude, 90)
+        high = np.percentile(magnitude, 99.5)
+
+        if high > low:
             edges = np.clip(
-                (edges - threshold) / (max_edge - threshold),
+                (magnitude - low) / (high - low),
                 0,
-                1,
+                1
             )
         else:
-            edges = np.zeros_like(edges)
+            edges = np.zeros_like(magnitude)
 
-        # Немного усиливаем выбранные контуры.
-        edges = edges ** 0.8
+        edges = edges ** 1.5
 
-        # 5. Создаём фиолетовый слой свечения (BGR).
-        glow = np.zeros_like(original)
-        glow[:, :, 0] = edges * 210
-        glow[:, :, 2] = edges * 255
+        glow = np.zeros_like(image, dtype=np.float32)
 
-        # 6. Размываем только слой свечения.
-        blurred_glow = glow.copy()
-        iterations = min(max(int(blur * 3), 0), 10)
+        glow[:, :, 0] = 220 * edges
+        glow[:, :, 1] = 15 * edges
+        glow[:, :, 2] = 255 * edges
 
-        for _ in range(iterations):
-            blurred_glow = box_blur(blurred_glow)
+        near_glow = self.gaussian_blur(
+            glow,
+            sigma=3.5
+        )
 
-        # 7. Сохраняем исходную яркость и накладываем свечение.
-        result = original.copy()
-        result += blurred_glow * strength * 0.65
+        middle_glow = self.gaussian_blur(
+            glow,
+            sigma=max(2.0, blur * 2.5)
+        )
 
-        # 8. Добавляем тонкую яркую линию по центру контура.
-        core = np.zeros_like(original)
-        core[:, :, 0] = edges * 220
-        core[:, :, 1] = edges * 100
-        core[:, :, 2] = edges * 255
+        wide_glow = self.gaussian_blur(
+            glow,
+            sigma=max(4.0, blur * 5.0)
+        )
 
-        result += core * 0.8
+        core = np.zeros_like(image, dtype=np.float32)
+
+        core[:, :, 0] = 255 * edges
+        core[:, :, 1] = 175 * edges
+        core[:, :, 2] = 255 * edges
+
+        base = image * 0.65
+
+        result = (
+            base
+            + wide_glow * strength * 5.0
+            + middle_glow * strength * 2.5
+            + near_glow * strength * 1.5
+            + core * strength
+        )
 
         return np.clip(result, 0, 255).astype(np.uint8)
+
+
+
+
+
+
